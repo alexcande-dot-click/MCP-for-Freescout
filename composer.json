@@ -1,0 +1,24 @@
+{
+    "name": "alexcande-dot-click/mcp-for-freescout",
+    "description": "Model Context Protocol server for FreeScout.",
+    "license": "AGPL-3.0-only",
+    "authors": [
+        {
+            "name": "Maumar.Click",
+            "homepage": "https://maumar.click"
+        }
+    ],
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Modules\\McpForFreescout\\Providers\\McpForFreescoutServiceProvider"
+            ],
+            "aliases": {}
+        }
+    },
+    "autoload": {
+        "psr-4": {
+            "Modules\\McpForFreescout\\": ""
+        }
+    }
+}

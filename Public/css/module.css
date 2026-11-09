@@ -1,0 +1,23 @@
+/* MCP for FreeScout */
+
+.mcp-tokens .mcp-token-form .form-control {
+    min-width: 260px;
+}
+
+.mcp-tokens .mcp-token-created .mcp-token-plaintext,
+.mcp-tokens .mcp-token-created .mcp-token-snippet {
+    font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
+    font-size: 13px;
+}
+
+.mcp-tokens .mcp-token-created .mcp-token-snippet {
+    resize: none;
+}
+
+.mcp-tokens .mcp-token-created .btn-link {
+    padding-left: 0;
+}
+
+.mcp-tokens .mcp-tokens-table code {
+    white-space: nowrap;
+}
