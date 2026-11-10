@@ -2,7 +2,9 @@
 
 namespace Modules\McpForFreescout\Tests\Integration\Tools;
 
+use App\Attachment;
 use App\Conversation;
+use App\Folder;
 use App\Thread;
 use App\User;
 use Modules\McpForFreescout\Mcp\ToolError;
@@ -12,7 +14,10 @@ use Modules\McpForFreescout\Tests\Fixtures;
 use Modules\McpForFreescout\Tests\TestCase;
 use Modules\McpForFreescout\Tools\Conversations\AddNoteTool;
 use Modules\McpForFreescout\Tools\Conversations\DeleteConversationTool;
+use Modules\McpForFreescout\Tools\Conversations\GetConversationTool;
+use Modules\McpForFreescout\Tools\Conversations\ListConversationsTool;
 use Modules\McpForFreescout\Tools\Conversations\RestoreConversationTool;
+use Modules\McpForFreescout\Tools\Conversations\StarConversationTool;
 use Modules\McpForFreescout\Tools\Conversations\UpdateConversationTool;
 
 class ConversationWriteToolsTest extends TestCase
@@ -21,6 +26,7 @@ class ConversationWriteToolsTest extends TestCase
     private $colleague;
     private $mailbox;
     private $conversation;
+    private $lastAttachmentId;
 
     protected function setUp(): void
     {
@@ -30,11 +36,17 @@ class ConversationWriteToolsTest extends TestCase
         $this->colleague = Fixtures::user();
         $this->mailbox = Fixtures::mailbox([], [$this->user, $this->colleague]);
         $this->conversation = Fixtures::conversation($this->mailbox, Fixtures::customer());
+        $this->lastAttachmentId = (int) Attachment::max('id');
     }
 
     protected function tearDown(): void
     {
         app()->forgetInstance(ToolRegistry::class);
+        // The database rollback does not remove the stored files.
+        $created = Attachment::where('id', '>', $this->lastAttachmentId)->get();
+        if (count($created)) {
+            Attachment::deleteForever($created);
+        }
 
         parent::tearDown();
     }
@@ -184,6 +196,93 @@ class ConversationWriteToolsTest extends TestCase
         $this->assertNull($fresh->user_id);
     }
 
+    public function test_note_with_file_is_published_with_the_file()
+    {
+        $before = $this->customerEmailJobs();
+        $bytes = 'Call log '.random_bytes(16);
+
+        $result = (new AddNoteTool())->handle([
+            'conversation_id' => $this->conversation->id,
+            'body'            => 'Notes from the call, see the log.',
+            'attachments'     => [['file_name' => 'mcp-test-call-log.txt', 'content_base64' => base64_encode($bytes), 'mime_type' => 'text/plain']],
+        ], $this->user);
+
+        $note = Thread::find($result['thread_id']);
+        $this->assertSame(Thread::TYPE_NOTE, (int) $note->type);
+        $this->assertSame(Thread::STATE_PUBLISHED, (int) $note->state);
+        $this->assertTrue((bool) $note->has_attachments);
+
+        $files = Attachment::where('thread_id', $note->id)->get();
+        $this->assertCount(1, $files);
+        $this->assertSame('mcp-test-call-log.txt', $files[0]->file_name);
+        $this->assertSame($bytes, Attachment::getDisk()->get($files[0]->getStorageFilePath()));
+        $this->assertFalse((bool) $files[0]->embedded);
+        $this->assertTrue((bool) $this->conversation->fresh()->has_attachments);
+        // Notes notify the team like in the web UI, but never the customer.
+        $this->assertSame($before, $this->customerEmailJobs());
+    }
+
+    public function test_note_with_a_bad_file_is_not_added()
+    {
+        $notes = Thread::where('type', Thread::TYPE_NOTE)->count();
+        $attachments = Attachment::count();
+
+        try {
+            (new AddNoteTool())->handle([
+                'conversation_id' => $this->conversation->id,
+                'body'            => 'Should not appear.',
+                'attachments'     => [
+                    ['file_name' => 'mcp-test-ok.txt', 'content_base64' => base64_encode('ok')],
+                    ['file_name' => 'mcp-test-bad.txt', 'content_base64' => '***'],
+                ],
+            ], $this->user);
+            $this->fail('The invalid file was accepted.');
+        } catch (ToolError $e) {
+            $this->assertStringContainsString('attachments[1]', $e->getMessage());
+        }
+
+        $this->assertSame($notes, Thread::where('type', Thread::TYPE_NOTE)->count());
+        $this->assertSame($attachments, Attachment::count());
+    }
+
+    public function test_failed_note_leaves_no_orphan_files()
+    {
+        $attachments = Attachment::count();
+
+        // Core fails after it has read the note and before it links the files to it.
+        $failing = function () {
+            throw new \RuntimeException('Saving the note failed.');
+        };
+        \Eventy::addAction('conversation.send_reply_save', $failing, 20, 2);
+        try {
+            (new AddNoteTool())->handle([
+                'conversation_id' => $this->conversation->id,
+                'body'            => 'Never saved',
+                'attachments'     => [['file_name' => 'mcp-test-orphan.txt', 'content_base64' => base64_encode('orphan')]],
+            ], $this->user);
+            $this->fail('The failure of core was swallowed.');
+        } catch (\RuntimeException $e) {
+            $this->assertSame('Saving the note failed.', $e->getMessage());
+        } finally {
+            \Eventy::removeAction('conversation.send_reply_save', $failing, 20);
+        }
+
+        $this->assertSame($attachments, Attachment::count());
+        $this->assertSame(0, count(array_filter(Attachment::getDisk()->allFiles(Attachment::DIRECTORY), function ($path) {
+            return strpos(basename($path), 'mcp-test-') === 0;
+        })));
+    }
+
+    public function test_note_tool_offers_attachments()
+    {
+        $tool = new AddNoteTool();
+        $schema = $tool->inputSchema();
+
+        $this->assertSame('array', $schema['properties']['attachments']['type']);
+        $this->assertSame(['conversation_id', 'body'], $schema['required']);
+        $this->assertStringContainsString('attachments', $tool->description());
+    }
+
     public function test_add_note_keeps_status_and_assignee()
     {
         $this->conversation->forceFill(['user_id' => $this->colleague->id, 'status' => Conversation::STATUS_PENDING])->save();
@@ -302,10 +401,120 @@ class ConversationWriteToolsTest extends TestCase
         }
     }
 
+    public function test_star_and_unstar_for_the_caller_only()
+    {
+        $tool = new StarConversationTool();
+        $arguments = ['conversation_id' => $this->conversation->id];
+        $starredIds = function (User $user) {
+            return array_column((new ListConversationsTool())->handle([
+                'mailbox_id' => $this->mailbox->id,
+                'folder'     => 'starred',
+            ], $user)['conversations'], 'id');
+        };
+        $starredFor = function (User $user) use ($arguments) {
+            return (new GetConversationTool())->handle($arguments, $user)['starred'];
+        };
+
+        $starred = $tool->handle($arguments + ['starred' => true], $this->user);
+
+        $this->assertTrue($starred['starred']);
+        $this->assertSame((int) $this->conversation->id, $starred['id']);
+        $this->assertTrue($starredFor($this->user));
+        $this->assertFalse($starredFor($this->colleague));
+        $this->assertSame([(int) $this->conversation->id], $starredIds($this->user));
+        $this->assertSame([], $starredIds($this->colleague));
+
+        $unstarred = $tool->handle($arguments + ['starred' => false], $this->user);
+
+        $this->assertFalse($unstarred['starred']);
+        $this->assertFalse($starredFor($this->user));
+        $this->assertSame([], $starredIds($this->user));
+    }
+
+    public function test_star_is_idempotent()
+    {
+        $tool = new StarConversationTool();
+        $arguments = ['conversation_id' => $this->conversation->id];
+        $rows = function () {
+            return \DB::table('conversation_folder')
+                ->join('folders', 'folders.id', '=', 'conversation_folder.folder_id')
+                ->where('conversation_folder.conversation_id', $this->conversation->id)
+                ->where('folders.type', Folder::TYPE_STARRED)
+                ->count();
+        };
+
+        $this->assertFalse($tool->handle($arguments + ['starred' => false], $this->user)['starred']);
+        $this->assertSame(0, $rows());
+
+        $this->assertTrue($tool->handle($arguments + ['starred' => true], $this->user)['starred']);
+        $this->assertTrue($tool->handle($arguments + ['starred' => true], $this->user)['starred']);
+        $this->assertSame(1, $rows());
+
+        $this->assertFalse($tool->handle($arguments + ['starred' => false], $this->user)['starred']);
+        $this->assertFalse($tool->handle($arguments + ['starred' => false], $this->user)['starred']);
+        $this->assertSame(0, $rows());
+    }
+
+    public function test_star_without_a_personal_starred_folder_is_an_error()
+    {
+        Folder::where('mailbox_id', $this->mailbox->id)
+            ->where('user_id', $this->user->id)
+            ->where('type', Folder::TYPE_STARRED)
+            ->delete();
+
+        try {
+            (new StarConversationTool())->handle(['conversation_id' => $this->conversation->id, 'starred' => true], $this->user);
+            $this->fail('A ToolError was expected without a Starred folder.');
+        } catch (ToolError $e) {
+            $this->assertSame('The conversation could not be starred: you have no Starred folder in this mailbox.', $e->getMessage());
+        }
+
+        $this->assertSame(0, \DB::table('conversation_folder')->where('conversation_id', $this->conversation->id)->count());
+    }
+
+    public function test_star_refuses_inaccessible_conversation()
+    {
+        $outsider = Fixtures::user();
+
+        foreach ([$this->conversation->id, 999999999] as $id) {
+            try {
+                (new StarConversationTool())->handle(['conversation_id' => $id, 'starred' => true], $outsider);
+                $this->fail('A ToolError was expected.');
+            } catch (ToolError $e) {
+                $this->assertSame('Conversation not found or not accessible.', $e->getMessage());
+            }
+        }
+
+        $this->assertSame(0, \DB::table('conversation_folder')->where('conversation_id', $this->conversation->id)->count());
+    }
+
+    public function test_star_refuses_a_draft_conversation()
+    {
+        $draft = Fixtures::conversation($this->mailbox, Fixtures::customer(), ['state' => Conversation::STATE_DRAFT]);
+
+        try {
+            (new StarConversationTool())->handle(['conversation_id' => $draft->id, 'starred' => true], $this->user);
+            $this->fail('A ToolError was expected for a draft conversation.');
+        } catch (ToolError $e) {
+            $this->assertStringContainsString('draft conversation', $e->getMessage());
+        }
+
+        $this->assertSame(0, \DB::table('conversation_folder')->where('conversation_id', $draft->id)->count());
+    }
+
+    public function test_star_requires_the_starred_argument()
+    {
+        $this->expectException(ToolError::class);
+        $this->expectExceptionMessage('"starred"');
+
+        (new StarConversationTool())->handle(['conversation_id' => $this->conversation->id], $this->user);
+    }
+
     public function test_annotations()
     {
         $this->assertSame(['readOnlyHint' => false, 'idempotentHint' => true], (new UpdateConversationTool())->annotations());
         $this->assertSame(['readOnlyHint' => false], (new AddNoteTool())->annotations());
+        $this->assertSame(['readOnlyHint' => false, 'idempotentHint' => true], (new StarConversationTool())->annotations());
         $this->assertSame(['readOnlyHint' => false, 'destructiveHint' => true], (new DeleteConversationTool())->annotations());
         $this->assertSame(
             ['readOnlyHint' => false, 'destructiveHint' => false, 'idempotentHint' => true],
@@ -321,7 +530,7 @@ class ConversationWriteToolsTest extends TestCase
             $names[] = $tool->name();
         }
 
-        foreach (['update_conversation', 'add_note', 'delete_conversation', 'restore_conversation'] as $name) {
+        foreach (['update_conversation', 'add_note', 'delete_conversation', 'restore_conversation', 'star_conversation'] as $name) {
             $this->assertContains($name, $names);
         }
         foreach ($names as $name) {

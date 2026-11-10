@@ -293,10 +293,17 @@ class Server
         }
 
         try {
-            $data = $this->structuredContent($tool, $tool->handle($arguments, $user));
+            $output = $tool->handle($arguments, $user);
+            $extraContent = [];
+            if ($output instanceof ToolResult) {
+                $extraContent = $output->extraContent();
+                $output = $output->structured();
+            }
+
+            $data = $this->structuredContent($tool, $output);
             $this->audit($tool, $arguments, $user, $tokenPrefix);
             $result = [
-                'content' => [['type' => 'text', 'text' => $this->encodeResult($tool, $data)]],
+                'content' => array_merge([['type' => 'text', 'text' => $this->encodeResult($tool, $data)]], $extraContent),
                 'structuredContent' => $data,
             ];
         } catch (ToolError $e) {

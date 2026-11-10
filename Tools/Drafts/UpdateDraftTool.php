@@ -92,27 +92,17 @@ class UpdateDraftTool extends DraftTool
         $choices = $this->choices($arguments, $mailbox, $savedReply, true);
 
         // Core saves the whole form again, so what is not changing is posted as it is.
-        $to = $to ?? $draft->getToArray();
-        $params = [
-            'mailbox_id'      => $mailbox->id,
-            'conversation_id' => $conversation->id,
-            'thread_id'       => $draft->id,
-            'body'            => $this->newBody($body, $savedReply, $conversation, $draft, $user),
-            'from_alias'      => $from,
-            'cc'              => $this->recipients($arguments, 'cc') ?? $draft->getCcArray(),
-            'bcc'             => $this->recipients($arguments, 'bcc') ?? $draft->getBccArray(),
-        ];
+        $params = $this->currentDraftParams($draft);
+        $params['body'] = $this->newBody($body, $savedReply, $conversation, $draft, $user);
+        $params['from_alias'] = $from;
+        $params['cc'] = $this->recipients($arguments, 'cc') ?? $params['cc'];
+        $params['bcc'] = $this->recipients($arguments, 'bcc') ?? $params['bcc'];
         if ($isNewConversation) {
-            $params += [
-                'is_create' => 1,
-                'type'      => $conversation->type,
-                'status'    => $conversation->status,
-                'subject'   => $subject ?? $conversation->subject,
-                'to'        => $to,
-            ];
-        } else {
+            $params['subject'] = $subject ?? $params['subject'];
+            $params['to'] = $to ?? $params['to'];
+        } elseif ($to !== null) {
             // A reply has a single To recipient, posted as a string like the reply form does.
-            $params['to'] = $to ? reset($to) : '';
+            $params['to'] = reset($to);
         }
 
         return $this->result($this->saveDraft($user, $params, $savedReply), $choices);

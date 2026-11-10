@@ -2,18 +2,24 @@
 
 namespace Modules\McpForFreescout\Tests\Integration\Tools;
 
+use App\ActivityLog;
+use App\Attachment;
 use App\Conversation;
 use App\Thread;
 use App\User;
+use Modules\McpForFreescout\Mcp\Server;
 use Modules\McpForFreescout\Mcp\ToolError;
 use Modules\McpForFreescout\Mcp\ToolRegistry;
+use Modules\McpForFreescout\Support\CompanionModules;
 use Modules\McpForFreescout\Support\DraftChoices;
+use Modules\McpForFreescout\Support\RemoteFetcher;
 use Modules\McpForFreescout\Tests\Fixtures;
 use Modules\McpForFreescout\Tests\TestCase;
 use Modules\McpForFreescout\Tools\Drafts\CreateConversationTool;
 use Modules\McpForFreescout\Tools\Drafts\DiscardDraftTool;
 use Modules\McpForFreescout\Tools\Drafts\ReplyToConversationTool;
 use Modules\McpForFreescout\Tools\Drafts\UpdateDraftTool;
+use Modules\SavedReplies\Entities\SavedReply;
 
 class DraftToolsTest extends TestCase
 {
@@ -26,6 +32,7 @@ class DraftToolsTest extends TestCase
     private $conversation;
     private $jobsAtStart;
     private $sentMessagesAtStart;
+    private $lastAttachmentId;
 
     protected function setUp(): void
     {
@@ -39,6 +46,7 @@ class DraftToolsTest extends TestCase
 
         $this->jobsAtStart = $this->jobCount();
         $this->sentMessagesAtStart = $this->publishedMessageCount();
+        $this->lastAttachmentId = (int) Attachment::max('id');
     }
 
     /**
@@ -56,6 +64,12 @@ class DraftToolsTest extends TestCase
     protected function tearDown(): void
     {
         app()->forgetInstance(ToolRegistry::class);
+        app()->forgetInstance(RemoteFetcher::class);
+        // The database rollback does not remove the stored files.
+        $created = Attachment::where('id', '>', $this->lastAttachmentId)->get();
+        if (count($created)) {
+            Attachment::deleteForever($created);
+        }
 
         parent::tearDown();
     }
@@ -86,6 +100,223 @@ class DraftToolsTest extends TestCase
         $this->assertSame($jobs, $this->jobCount());
         $this->assertSame(Conversation::STATE_PUBLISHED, (int) $this->conversation->fresh()->state);
         $this->assertSame(1, $this->publishedThreads($this->conversation));
+    }
+
+    public function test_reply_with_base64_file_attaches_it_to_the_draft()
+    {
+        $jobs = $this->jobCount();
+        $bytes = "Quarterly figures\n".random_bytes(32);
+
+        $result = (new ReplyToConversationTool())->handle([
+            'conversation_id' => $this->conversation->id,
+            'body'            => 'See the attached file.',
+            'attachments'     => [['file_name' => 'mcp-test-figures.txt', 'content_base64' => base64_encode($bytes), 'mime_type' => 'text/plain']],
+        ], $this->user);
+
+        $draft = Thread::find($result['draft_id']);
+        $this->assertSame(Thread::STATE_DRAFT, (int) $draft->state);
+        $this->assertTrue((bool) $draft->has_attachments);
+
+        $files = Attachment::where('thread_id', $draft->id)->get();
+        $this->assertCount(1, $files);
+        $this->assertSame('mcp-test-figures.txt', $files[0]->file_name);
+        $this->assertSame(strlen($bytes), (int) $files[0]->size);
+        $this->assertFalse((bool) $files[0]->embedded);
+        $this->assertSame((int) $this->user->id, (int) $files[0]->user_id);
+        $this->assertTrue($files[0]->fileExists());
+        $this->assertSame($jobs, $this->jobCount());
+    }
+
+    public function test_create_conversation_with_url_file()
+    {
+        $fetcher = $this->fakeFetcher(['bytes' => 'downloaded content', 'mime_type' => 'text/plain']);
+
+        $result = (new CreateConversationTool())->handle([
+            'mailbox_id'  => $this->mailbox->id,
+            'to'          => ['new@example.test'],
+            'subject'     => 'Documents',
+            'body'        => 'Here is the file.',
+            'attachments' => [['file_name' => 'mcp-test-remote.txt', 'url' => 'https://files.example.test/a.txt']],
+        ], $this->user);
+
+        $this->assertCount(1, $fetcher->calls);
+        $this->assertSame('https://files.example.test/a.txt', $fetcher->calls[0][0]);
+        $draft = Thread::find($result['draft_id']);
+        $this->assertSame(Thread::STATE_DRAFT, (int) $draft->state);
+        $this->assertTrue((bool) $draft->has_attachments);
+        $this->assertTrue((bool) Conversation::find($result['conversation_id'])->has_attachments);
+
+        $files = Attachment::where('thread_id', $draft->id)->get();
+        $this->assertCount(1, $files);
+        $this->assertSame('mcp-test-remote.txt', $files[0]->file_name);
+        $this->assertSame('downloaded content', \App\Attachment::getDisk()->get($files[0]->getStorageFilePath()));
+    }
+
+    public function test_create_conversation_files_are_kept_when_a_saved_reply_supplies_the_text()
+    {
+        $this->requireModule(CompanionModules::SAVED_REPLIES);
+
+        $reply = new SavedReply();
+        $reply->mailbox_id = $this->mailbox->id;
+        $reply->name = 'Greeting';
+        $reply->text = '<p>Hello {%customer.firstName%}</p>';
+        $reply->user_id = $this->user->id;
+        $reply->save();
+
+        $result = (new CreateConversationTool())->handle([
+            'mailbox_id'     => $this->mailbox->id,
+            'to'             => ['new@example.test'],
+            'subject'        => 'Greeting',
+            'saved_reply_id' => $reply->id,
+            'attachments'    => [['file_name' => 'mcp-test-extra.txt', 'content_base64' => base64_encode('extra')]],
+        ], $this->user);
+
+        $files = Attachment::where('thread_id', $result['draft_id'])->get();
+        $this->assertSame(['mcp-test-extra.txt'], $files->pluck('file_name')->all());
+    }
+
+    public function test_reply_refuses_files_over_message_size()
+    {
+        config(['app.max_message_size' => 1]);
+        $attachments = Attachment::count();
+        $drafts = $this->draftCount();
+        $files = $this->testFilesOnDisk();
+
+        try {
+            (new ReplyToConversationTool())->handle([
+                'conversation_id' => $this->conversation->id,
+                'body'            => 'Too much.',
+                // Under 1 MB as a file, over it once encoded for mail (x 1.37).
+                'attachments'     => [['file_name' => 'mcp-test-big.bin', 'content_base64' => base64_encode(str_repeat('x', 800000))]],
+            ], $this->user);
+            $this->fail('The oversized draft was accepted.');
+        } catch (ToolError $e) {
+            $this->assertStringContainsString('maximum message size of 1 MB', $e->getMessage());
+            $this->assertStringContainsString('Remove a file with remove_attachment or send it as a link.', $e->getMessage());
+        }
+
+        $this->assertSame($attachments, Attachment::count());
+        $this->assertSame($drafts, $this->draftCount());
+        $this->assertSame($files, $this->testFilesOnDisk());
+    }
+
+    public function test_message_size_check_uses_the_core_formula()
+    {
+        config(['app.max_message_size' => 1]);
+        $tool = new ReplyToConversationTool();
+        $check = new \ReflectionMethod($tool, 'assertWithinMessageSize');
+        $check->setAccessible(true);
+        $limit = (int) floor(1024 * 1024 / 1.37);
+
+        // The size at the limit passes; one byte more does not.
+        $check->invoke($tool, str_repeat('a', 10), [$limit - 10]);
+        $this->expectException(ToolError::class);
+        $check->invoke($tool, str_repeat('a', 10), [$limit - 9]);
+    }
+
+    public function test_failed_reply_leaves_no_orphan_files()
+    {
+        // Core refuses a message equal to the user's latest one in the conversation.
+        $previous = new Thread();
+        $previous->forceFill([
+            'conversation_id'    => $this->conversation->id,
+            'type'               => Thread::TYPE_MESSAGE,
+            'status'             => Conversation::STATUS_ACTIVE,
+            'state'              => Thread::STATE_PUBLISHED,
+            'body'               => '<p>Same</p>',
+            'created_by_user_id' => $this->user->id,
+            'source_via'         => Thread::PERSON_USER,
+            'source_type'        => Thread::SOURCE_TYPE_WEB,
+        ]);
+        $previous->save();
+        $this->sentMessagesAtStart++;
+
+        $attachments = Attachment::count();
+        $files = $this->testFilesOnDisk();
+
+        try {
+            (new ReplyToConversationTool())->handle([
+                'conversation_id' => $this->conversation->id,
+                'body'            => '<p>Same</p>',
+                'attachments'     => [
+                    ['file_name' => 'mcp-test-one.txt', 'content_base64' => base64_encode('one')],
+                    ['file_name' => 'mcp-test-two.txt', 'content_base64' => base64_encode('two')],
+                ],
+            ], $this->user);
+            $this->fail('Core accepted the repeated message.');
+        } catch (ToolError $e) {
+            $this->assertStringContainsString('already sent this message', $e->getMessage());
+        }
+
+        $this->assertSame($attachments, Attachment::count());
+        $this->assertSame($files, $this->testFilesOnDisk());
+    }
+
+    public function test_a_bad_second_file_creates_no_draft_and_no_files()
+    {
+        $attachments = Attachment::count();
+        $drafts = $this->draftCount();
+        $files = $this->testFilesOnDisk();
+
+        try {
+            (new ReplyToConversationTool())->handle([
+                'conversation_id' => $this->conversation->id,
+                'body'            => 'Hello',
+                'attachments'     => [
+                    ['file_name' => 'mcp-test-good.txt', 'content_base64' => base64_encode('good')],
+                    ['file_name' => 'mcp-test-bad.txt', 'content_base64' => '***'],
+                ],
+            ], $this->user);
+            $this->fail('The invalid file was accepted.');
+        } catch (ToolError $e) {
+            $this->assertStringContainsString('attachments[1]', $e->getMessage());
+        }
+
+        $this->assertSame($attachments, Attachment::count());
+        $this->assertSame($drafts, $this->draftCount());
+        $this->assertSame($files, $this->testFilesOnDisk());
+    }
+
+    public function test_attachments_are_offered_by_both_drafting_tools()
+    {
+        foreach ([new ReplyToConversationTool(), new CreateConversationTool()] as $tool) {
+            $schema = $tool->inputSchema();
+            $this->assertSame('array', $schema['properties']['attachments']['type'], $tool->name());
+            $this->assertNotContains('attachments', $schema['required']);
+            $this->assertStringContainsString('attachments', $tool->description(), $tool->name());
+        }
+    }
+
+    public function test_audit_entry_never_holds_file_content()
+    {
+        $encoded = base64_encode('Confidential audit content '.random_bytes(24));
+        $server = new Server(app(ToolRegistry::class));
+        $before = (int) ActivityLog::inLog('mcpforfreescout')->max('id');
+
+        $response = $server->handle(
+            ['mcp-protocol-version' => '2025-11-25'],
+            json_encode([
+                'jsonrpc' => '2.0',
+                'id'      => 1,
+                'method'  => 'tools/call',
+                'params'  => ['name' => 'reply_to_conversation', 'arguments' => [
+                    'conversation_id' => $this->conversation->id,
+                    'body'            => 'Audited reply',
+                    'attachments'     => [['file_name' => 'mcp-test-secret-name.pdf', 'content_base64' => $encoded]],
+                ]],
+            ]),
+            $this->user,
+            'fsmcp_ab12'
+        );
+
+        $this->assertArrayNotHasKey('isError', $response->body()['result'], json_encode($response->body()));
+        $entry = ActivityLog::inLog('mcpforfreescout')->where('id', '>', $before)->orderBy('id', 'desc')->first();
+        $this->assertNotNull($entry);
+        $this->assertSame('reply_to_conversation', $entry->description);
+        $logged = json_encode($entry->properties);
+        $this->assertStringNotContainsString($encoded, $logged);
+        $this->assertStringNotContainsString('secret-name', $logged);
+        $this->assertSame([(int) $this->conversation->id], [$entry->properties['arguments']['conversation_id']]);
     }
 
     public function test_reply_goes_to_an_explicit_single_recipient()
@@ -489,6 +720,64 @@ class DraftToolsTest extends TestCase
         $this->assertSame($jobs, $this->jobCount());
     }
 
+    public function test_update_draft_keeps_existing_files_in_every_variant()
+    {
+        $draft = $this->draftReply([
+            'status_after_send' => 'pending',
+            'attachments'       => [
+                ['file_name' => 'mcp-test-first.txt', 'content_base64' => base64_encode('first')],
+                ['file_name' => 'mcp-test-second.txt', 'content_base64' => base64_encode('second')],
+            ],
+        ]);
+        $original = Attachment::where('thread_id', $draft->id)->orderBy('id')->pluck('id')->all();
+        $this->assertCount(2, $original);
+        $tool = new UpdateDraftTool();
+
+        $variants = [
+            'body'              => ['body' => 'New text'],
+            'recipients'        => ['to' => ['other@example.test'], 'cc' => ['copy@example.test'], 'bcc' => []],
+            'from alias'        => ['from_alias' => self::ALIAS],
+            'choices'           => ['status_after_send' => 'closed', 'assignee_after_send' => $this->colleague->id],
+            'clearing a choice' => ['status_after_send' => null],
+        ];
+        foreach ($variants as $name => $arguments) {
+            $tool->handle(['draft_id' => $draft->id] + $arguments, $this->user);
+
+            $this->assertSame($original, Attachment::where('thread_id', $draft->id)->orderBy('id')->pluck('id')->all(), $name);
+            foreach (Attachment::whereIn('id', $original)->get() as $file) {
+                $this->assertTrue($file->fileExists(), $name);
+            }
+            $this->assertTrue((bool) $draft->fresh()->has_attachments, $name);
+        }
+        $this->assertSame(1, $this->draftCount());
+    }
+
+    public function test_update_draft_with_a_saved_reply_keeps_existing_files_and_adds_its_files()
+    {
+        $this->requireModule(CompanionModules::SAVED_REPLIES);
+
+        $reply = new SavedReply();
+        $reply->mailbox_id = $this->mailbox->id;
+        $reply->name = 'With file';
+        $reply->text = '<p>Canned</p>';
+        $reply->user_id = $this->user->id;
+        $stock = Attachment::create('mcp-test-stock.txt', 'text/plain', null, 'stock', null);
+        $reply->attachments = [$stock->id];
+        $reply->save();
+
+        $draft = $this->draftReply(['attachments' => [['file_name' => 'mcp-test-mine.txt', 'content_base64' => base64_encode('mine')]]]);
+        $mine = Attachment::where('thread_id', $draft->id)->pluck('id')->all();
+
+        (new UpdateDraftTool())->handle(['draft_id' => $draft->id, 'saved_reply_id' => $reply->id], $this->user);
+
+        $names = Attachment::where('thread_id', $draft->id)->orderBy('id')->pluck('file_name')->all();
+        $this->assertSame(['mcp-test-mine.txt', 'mcp-test-stock.txt'], $names);
+        $this->assertContains($mine[0], Attachment::where('thread_id', $draft->id)->pluck('id')->all());
+        // The saved reply keeps its own file.
+        $this->assertNotNull(Attachment::find($stock->id));
+        $this->assertNull(Attachment::find($stock->id)->thread_id);
+    }
+
     public function test_update_draft_of_a_new_conversation_can_change_the_subject_and_recipients()
     {
         $created = (new CreateConversationTool())->handle([
@@ -710,6 +999,42 @@ class DraftToolsTest extends TestCase
         ], $extra), $this->user);
 
         return Thread::find($result['draft_id']);
+    }
+
+    /**
+     * Answer link downloads with a fixed result instead of using the network.
+     */
+    private function fakeFetcher(array $response): RemoteFetcher
+    {
+        $fetcher = new class($response) implements RemoteFetcher {
+            public $calls = [];
+            private $response;
+
+            public function __construct(array $response)
+            {
+                $this->response = $response;
+            }
+
+            public function fetch(string $url, int $maxBytes): array
+            {
+                $this->calls[] = [$url, $maxBytes];
+
+                return $this->response;
+            }
+        };
+        app()->instance(RemoteFetcher::class, $fetcher);
+
+        return $fetcher;
+    }
+
+    /**
+     * The attachment files on disk that tests of this class make; their names start with "mcp-test-".
+     */
+    private function testFilesOnDisk(): int
+    {
+        return count(array_filter(Attachment::getDisk()->allFiles(Attachment::DIRECTORY), function ($path) {
+            return strpos(basename($path), 'mcp-test-') === 0;
+        }));
     }
 
     private function jobCount(): int

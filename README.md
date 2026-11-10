@@ -23,7 +23,7 @@ FreeScout's official API (the paid "API & Webhooks" module) cannot choose the **
 
 - MCP endpoint at `/mcp` using Streamable HTTP with bearer-token authentication. Stateless: every request is answered with `application/json`, no sessions, no SSE streams.
 - One token per user (a user may hold several). The agent acts as that user, with that user's permissions, and every change is attributed to that user in FreeScout's history.
-- Full support workflow: read mailboxes and conversations, search, write reply and new-email drafts with a chosen From alias, signature, To/CC/BCC and status/assignee to apply on send, add notes, change status, assignee and subject, move conversations to the trash and restore them.
+- Full support workflow: read mailboxes and conversations, search, write reply and new-email drafts with a chosen From alias, signature, To/CC/BCC and status/assignee to apply on send, add notes, attach files to drafts and notes, read the files of a conversation, star conversations, see whether a sent message was delivered or opened, change status, assignee and subject, move conversations to the trash and restore them.
 - Light administration: edit a mailbox (name, reply-from aliases, main signature).
 - Integration with four official companion modules when they are installed and active: Custom Mailbox Signatures, Saved Replies, Tags and Send Later.
 - Token management inside FreeScout: users manage their own tokens from their profile, administrators can see and revoke every token.
@@ -38,7 +38,7 @@ The module is built so that a mistaken or manipulated agent cannot do irreversib
 - **Trash only.** `delete_conversation` moves a conversation to the trash and `restore_conversation` brings it back. There is no tool to empty the trash and none to delete a conversation permanently. (Custom signatures, saved replies and tags can be deleted, when the user has the right to.)
 - **Per-user tokens that inherit FreeScout permissions.** A token authenticates as one FreeScout user. Every tool applies the same policies as the web interface (mailbox access, conversation visibility, settings rights). An action on an object the user may not touch returns a tool error, and tools of a companion module are hidden while the module is inactive. Disabling or deleting a user stops that user's tokens immediately.
 - **Re-validation at send time.** `send_draft` checks everything again at the moment of sending, not as it was when the draft was written: the user's right to update the conversation, that the conversation is not in the trash, that the From alias is still allowed for the mailbox, and that the chosen signature and saved reply still exist.
-- **Audit log.** Every successful tool call that is not read-only writes an entry to FreeScout's activity log under the log name `mcpforfreescout` (Manage > Logs). An entry holds the tool name, the id of the user, the token prefix (for example `fsmcp_9a8b6e`, enough to tell tokens apart) and the **ids** found in the arguments (`conversation_id`, `mailbox_id`, `draft_id`, `tag_id`, `saved_reply_id`, and so on). It never holds message bodies, subjects, email addresses or names, and tag names are not recorded either: for `add_tags` and `remove_tags` only the conversation id is logged, not which tags changed. Failed calls are not logged, and read-only calls are not logged.
+- **Audit log.** Every successful tool call that is not read-only writes an entry to FreeScout's activity log under the log name `mcpforfreescout` (Manage > Logs). An entry holds the tool name, the id of the user, the token prefix (for example `fsmcp_9a8b6e`, enough to tell tokens apart) and the **ids** found in the arguments (`conversation_id`, `mailbox_id`, `draft_id`, `attachment_id`, `tag_id`, `saved_reply_id`, and so on). Only top-level arguments are scanned: the `attachment_id` values nested inside an `attachments` list are not recorded. It never holds message bodies, subjects, email addresses, names, file names, links or file content, and tag names are not recorded either: for `add_tags` and `remove_tags` only the conversation id is logged, not which tags changed. Failed calls are not logged, and read-only calls are not logged.
 
 ## Requirements
 
@@ -62,7 +62,7 @@ The endpoint is available straight away. To update, replace the `Modules/McpForF
 
 **Revoking a token.** Revoke it from the same page; clients using it lose access at once. Administrators see every user's tokens under **Manage > MCP tokens** and can revoke any of them (but cannot create tokens for other users).
 
-**Enabling and disabling the endpoint.** **Manage > Settings > MCP** has a switch for the whole endpoint. While it is off, `/mcp` answers every request with HTTP 503. The setting page also shows the endpoint URL.
+**Enabling and disabling the endpoint.** **Manage > Settings > MCP** has a switch for the whole endpoint. While it is off, `/mcp` answers every request with HTTP 503. The setting page also shows the endpoint URL and holds the maximum attachment size (see [Files and attachments](#files-and-attachments)).
 
 **Endpoint URL.** `https://<your-helpdesk>/mcp`. If FreeScout runs in a subdirectory, the URL includes it (`https://example.com/helpdesk/mcp`). Only `POST` is accepted.
 
@@ -104,6 +104,8 @@ The server declares the `tools` capability only. Tool results carry both a text 
 
 ## Tool reference
 
+The module offers 38 tools; tools of a companion module are hidden while that module is not installed and active, so a client may see fewer.
+
 Tools marked with a companion module appear in `tools/list` only while that module is installed and active. Parameters that belong to a companion module (`signature_id`, `saved_reply_id`, `send_at`, the `tag` filter of `list_conversations`) are accepted only while the module is active.
 
 ### Mailboxes
@@ -120,9 +122,10 @@ Tools marked with a companion module appear in `tools/list` only while that modu
 |---|---|---|
 | `list_conversations` | List conversations of the user's mailboxes with filters (mailbox, folder, status, assignee, tag) and paging, newest reply first. | Tags (for the `tag` filter) |
 | `search_conversations` | Search like the FreeScout search box: subject, customer, number, message text, senders and recipients; optional mailbox and status filters. | |
-| `get_conversation` | One conversation with messages, notes, the caller's own drafts, attachment names and sizes, tags and scheduled state. | |
+| `get_conversation` | One conversation with messages, notes, the caller's own drafts, the files of each message (with a download link), delivery state and open time of sent replies, tags and scheduled state. | |
 | `update_conversation` | Change status, assignee (an active user with access to the mailbox, or 0 to unassign) and/or subject; recorded in the history as the user. | |
-| `add_note` | Add an internal note. Published immediately, never sent to the customer. | |
+| `add_note` | Add an internal note, optionally with files (`attachments`). Published immediately, never sent to the customer. | |
+| `star_conversation` | Star or unstar a conversation for the calling user. Stars are personal; `list_conversations` lists them with `folder: "starred"`. | |
 | `delete_conversation` | Move a conversation to the trash. Never permanent. | |
 | `restore_conversation` | Bring a conversation back from the trash. | |
 
@@ -130,11 +133,19 @@ Tools marked with a companion module appear in `tools/list` only while that modu
 
 | Tool | Purpose | Companion module |
 |---|---|---|
-| `reply_to_conversation` | Write a reply as a draft (body or saved reply, From alias, To, CC, BCC, signature, status and assignee to apply on send). Sends nothing. | Custom Signatures (`signature_id`), Saved Replies (`saved_reply_id`) |
-| `create_conversation` | Start a new outgoing email conversation as a draft. Sends nothing. | Custom Signatures, Saved Replies |
+| `reply_to_conversation` | Write a reply as a draft (body or saved reply, From alias, To, CC, BCC, signature, files in `attachments`, status and assignee to apply on send). Sends nothing. | Custom Signatures (`signature_id`), Saved Replies (`saved_reply_id`) |
+| `create_conversation` | Start a new outgoing email conversation as a draft, optionally with files in `attachments`. Sends nothing. | Custom Signatures, Saved Replies |
 | `update_draft` | Change an unsent draft; only the given fields change. An explicit `null` for `signature_id`, `status_after_send`, `assignee_after_send` or `saved_reply_id` clears that stored choice (also while its companion module is inactive), so a stale choice never blocks a draft. | Custom Signatures, Saved Replies |
 | `discard_draft` | Delete an unsent draft. Published messages are never touched; the draft of a new conversation is refused if its conversation already holds sent or received messages. | |
 | `send_draft` | Send a draft, the only tool that sends email. Only drafts of email conversations are sent (chat and phone drafts are refused), and a forward draft is refused. With `send_at` it schedules the message instead; given an already scheduled message and no `send_at`, it sends it right away. Both need the `database` queue driver. | Send Later (`send_at`) |
+
+### Files
+
+| Tool | Purpose | Companion module |
+|---|---|---|
+| `get_attachment` | One file of a message, by the id that `get_conversation` lists: details, a download link and, for small images, the image itself. With `include_content` the bytes come back as an embedded resource. | |
+| `add_attachments` | Attach more files to your own unsent draft. The draft's text, recipients, From alias and choices stay as they are. Sends nothing. | |
+| `remove_attachment` | Remove a file from your own unsent draft and delete it. Images embedded in the text are not removable. | |
 
 ### Directory
 
@@ -179,6 +190,22 @@ Tools marked with a companion module appear in `tools/list` only while that modu
 | Tool | Purpose | Companion module |
 |---|---|---|
 | `cancel_scheduled_send` | Cancel a scheduled send; the message becomes a draft again. Needs the `database` queue driver. | Send Later |
+
+### Files and attachments
+
+- **The `attachments` argument.** `reply_to_conversation`, `create_conversation` and `add_note` accept a list of files. Each item holds exactly one source: `url` (a public http or https link), `content_base64` (the content, with or without a `data:<type>;base64,` prefix; line breaks are allowed) or `attachment_id` (a copy of a file FreeScout already holds, by the id `get_conversation` lists). `file_name` is required unless the source is `attachment_id`; `mime_type` is optional and detected from the content when omitted. A bad item is reported by its position (for example `attachments[1]`) and nothing is attached.
+- **Drafts first.** Files attached to a reply or a new conversation stay on the draft; nothing is sent until `send_draft`. `add_attachments` and `remove_attachment` change the files of an unsent draft only and leave its text, recipients, From alias and stored choices untouched. Notes are published at once, as in the web interface.
+- **Reading files.** `get_conversation` lists the files of every message, regular and embedded, each with a `url`. Those are FreeScout's signed download links: **anyone who holds the link can download the file without logging in**, so treat them as sensitive. `get_attachment` returns the same link; PNG, JPEG, GIF and WebP images up to 3.5 MB are also returned as an image the model can look at. Hand the link to your client's PDF or document tool, or pass `include_content` to receive the bytes as an embedded resource.
+- **Size limit.** One file is limited to 10 MB by default. An administrator can change that under **Manage > Settings > MCP > Maximum attachment size (MB)**; the minimum is 1 MB. The limit applies to every file the agent adds, to drafts and to notes alike, and to `include_content`. The draft as a whole must also stay within FreeScout's maximum message size (`APP_MAX_MESSAGE_SIZE`, counting the files already on the draft).
+- **Base64 versus links.** Base64 content travels inside the request, so it is limited by the PHP `post_max_size` and the web server's request limit, and a model has to produce every character. Use `url` for anything large.
+- **Remote links.** Only http and https links are fetched. Redirects are not followed (give the final link), addresses on internal networks are refused, and a download times out after 30 seconds. A call takes at most 20 files. The connection is pinned to the address that was checked, so a second DNS answer cannot redirect the download; when FreeScout's `APP_PROXY` is set, the proxy resolves hosts itself and the pin does not apply (internal hosts can be whitelisted with `APP_REMOTE_HOST_WHITE_LIST`). For a `url` source the MIME type comes from the response `Content-Type` first, then from content detection; a `mime_type` argument overrides both. FreeScout's own file links are refused as a `url` source; copy such a file with `attachment_id` instead.
+- **Agent files are never inline.** Files added through MCP are regular attachments, never images embedded in the message text.
+
+### Stars, delivery and opens
+
+- **`starred`.** Every conversation summary has a `starred` flag for the calling user. Use `star_conversation` to set it; `list_conversations` with `folder: "starred"` lists the starred ones; that folder needs `mailbox_id`. Draft conversations cannot be starred, and the call fails for a user who has no Starred folder in the mailbox.
+- **`delivery`.** Each sent message in `get_conversation` has `delivery`: a `status` (`queued`, `sent`, `delivered`, `send_error` or `delivery_error`) and an `error` text (`null` unless FreeScout recorded one).
+- **`opened_at`.** The time FreeScout's tracking image was first loaded. **An open is not proof that the customer read the message**: mail clients may preload images, and many block them, so treat it as a hint only.
 
 ## Companion modules and behaviour worth knowing
 

@@ -10,6 +10,7 @@ use Modules\McpForFreescout\Mcp\ToolRegistry;
 use Modules\McpForFreescout\Tests\Fixtures;
 use Modules\McpForFreescout\Tests\TestCase;
 use Modules\McpForFreescout\Tests\Unit\Support\AlphaEchoTool;
+use Modules\McpForFreescout\Tests\Unit\Support\BlocksEchoTool;
 use Modules\McpForFreescout\Tests\Unit\Support\EchoTool;
 use Modules\McpForFreescout\Tests\Unit\Support\MutatingEchoTool;
 use Modules\McpForFreescout\Tests\Unit\Support\UnavailableEchoTool;
@@ -293,6 +294,33 @@ class ServerTest extends TestCase
         $this->assertArrayNotHasKey('resultType', $result);
     }
 
+    public function test_tool_result_extra_blocks_follow_the_text_block()
+    {
+        $this->useBlocksTool();
+
+        $result = $this->callTool('blocks_echo', [])->body()['result'];
+
+        $this->assertCount(3, $result['content']);
+        $this->assertSame('text', $result['content'][0]['type']);
+        $this->assertSame('{"a":1}', $result['content'][0]['text']);
+        $this->assertSame(['type' => 'image', 'data' => 'AAAA', 'mimeType' => 'image/png'], $result['content'][1]);
+        $this->assertSame([
+            'type' => 'resource',
+            'resource' => ['uri' => 'freescout://attachment/7', 'mimeType' => 'application/pdf', 'blob' => 'BBBB'],
+        ], $result['content'][2]);
+        $this->assertSame(['a' => 1], $result['structuredContent']);
+    }
+
+    public function test_plain_array_results_are_unchanged()
+    {
+        $this->useBlocksTool();
+
+        $result = $this->callTool('blocks_echo', ['plain' => true])->body()['result'];
+
+        $this->assertCount(1, $result['content']);
+        $this->assertSame(['a' => 1], $result['structuredContent']);
+    }
+
     public function test_tools_call_modern_result_is_decorated()
     {
         $params = $this->meta(['name' => 'echo', 'arguments' => ['text' => 'hi']]);
@@ -569,6 +597,13 @@ class ServerTest extends TestCase
     /**
      * Call a tool in legacy mode.
      */
+    private function useBlocksTool(): void
+    {
+        $registry = new ToolRegistry();
+        $registry->register(BlocksEchoTool::class);
+        $this->server = new Server($registry);
+    }
+
     private function callTool(string $name, ?array $arguments): McpResponse
     {
         $params = ['name' => $name];

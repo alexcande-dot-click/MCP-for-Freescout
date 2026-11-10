@@ -30,6 +30,17 @@
         </div>
     </div>
 
+    <div class="form-group">
+        <label for="mcpforfreescout-max-attachment-size" class="col-sm-2 control-label">{{ __('Maximum attachment size (MB)') }}</label>
+
+        <div class="col-sm-6">
+            <input id="mcpforfreescout-max-attachment-size" type="number" min="1" step="any" name="settings[mcpforfreescout.max_attachment_size]" class="form-control input-sized" value="{{ round($settings['mcpforfreescout.max_attachment_size'] / 1048576, 2) }}">
+            <p class="help-block">
+                {{ __('Largest file an AI agent can add to a draft or a note, or receive as content. The minimum is 1 MB.') }}
+            </p>
+        </div>
+    </div>
+
     <div class="form-group margin-top margin-bottom">
         <div class="col-sm-6 col-sm-offset-2">
             <button type="submit" class="btn btn-primary">

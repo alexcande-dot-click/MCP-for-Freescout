@@ -2,6 +2,7 @@
 
 namespace Modules\McpForFreescout\Tools\Conversations;
 
+use App\Attachment;
 use App\Conversation;
 use App\Thread;
 use App\User;
@@ -9,6 +10,7 @@ use Modules\McpForFreescout\Mcp\Tool;
 use Modules\McpForFreescout\Mcp\ToolError;
 use Modules\McpForFreescout\Support\BodyFormatter;
 use Modules\McpForFreescout\Support\CoreActions;
+use Modules\McpForFreescout\Support\FileInputs;
 use Modules\McpForFreescout\Support\Lookup;
 
 class AddNoteTool extends Tool
@@ -22,7 +24,8 @@ class AddNoteTool extends Tool
     {
         return 'Add an internal note to a conversation. The note is published immediately and only visible to users; '
             .'nothing is sent to the customer, and the status and assignee do not change. '
-            .'Plain text is escaped and keeps its line breaks; a body that contains HTML is used as HTML.';
+            .'Plain text is escaped and keeps its line breaks; a body that contains HTML is used as HTML. '
+            .'Files can be attached with "attachments"; they are stored with the note.';
     }
 
     public function inputSchema(): array
@@ -32,6 +35,7 @@ class AddNoteTool extends Tool
             'properties'           => [
                 'conversation_id' => ['type' => 'integer', 'description' => 'Conversation id, from list_conversations or search_conversations.'],
                 'body'            => ['type' => 'string', 'description' => 'Note text.'],
+                'attachments'     => FileInputs::schema('Files to attach to the note. Each one comes from a link, base64 content or an existing attachment.'),
             ],
             'required'             => ['conversation_id', 'body'],
             'additionalProperties' => false,
@@ -61,10 +65,11 @@ class AddNoteTool extends Tool
             throw new ToolError('Notes cannot be added to a draft conversation.');
         }
 
-        $previousNoteId =(int) $this->notesQuery($conversation->id, $user)->value('id');
+        $previousNoteId = (int) $this->notesQuery($conversation->id, $user)->value('id');
+        $files = $this->optionalFiles($arguments, $user);
 
         // Like the web form, post the current status and assignee, so both stay as they are.
-        CoreActions::conversationAjax($user, [
+        $params = [
             'action'          => 'send_reply',
             'is_note'         => 1,
             'mailbox_id'      => $conversation->mailbox_id,
@@ -72,7 +77,24 @@ class AddNoteTool extends Tool
             'body'            => BodyFormatter::toHtml($body),
             'status'          => $conversation->status,
             'user_id'         => $conversation->user_id ?: -1,
-        ]);
+        ];
+        if ($files) {
+            // The form posts the encrypted ids of its uploads in both lists; core links them to the note.
+            $ids = array_map(function (Attachment $file) {
+                return encrypt($file->id);
+            }, $files);
+            $params += ['attachments_all' => $ids, 'attachments' => $ids];
+        }
+
+        try {
+            CoreActions::conversationAjax($user, $params);
+        } catch (\Throwable $e) {
+            if ($files) {
+                Attachment::deleteForever(collect($files));
+            }
+
+            throw $e;
+        }
 
         // Core's answer does not name the thread it created, so take the caller's newest note.
         $note = $this->notesQuery($conversation->id, $user)->where('id', '>', $previousNoteId)->first();

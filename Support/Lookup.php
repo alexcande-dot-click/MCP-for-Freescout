@@ -5,6 +5,7 @@ namespace Modules\McpForFreescout\Support;
 use App\Conversation;
 use App\Customer;
 use App\Mailbox;
+use App\Thread;
 use App\User;
 use Modules\McpForFreescout\Mcp\ToolError;
 
@@ -64,6 +65,26 @@ final class Lookup
         }
 
         return $conversation;
+    }
+
+    /**
+     * Whether a thread of an accessible conversation may be shown to the user.
+     *
+     * Published threads are visible to everyone with access to the conversation;
+     * a draft only to its author. Hidden threads and threads held for review are not shown.
+     * This is the one rule behind "what can I see", shared by every tool that reads threads.
+     *
+     * @param bool $includeDrafts Whether the user's own drafts count as visible.
+     */
+    public static function threadVisible(Thread $thread, User $user, bool $includeDrafts = true): bool
+    {
+        if ($thread->state == Thread::STATE_PUBLISHED) {
+            return true;
+        }
+
+        return $includeDrafts
+            && $thread->state == Thread::STATE_DRAFT
+            && (int) $thread->created_by_user_id === (int) $user->id;
     }
 
     private static function hasConversationIn(Customer $customer, array $mailboxIds): bool

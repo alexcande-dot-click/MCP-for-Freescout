@@ -4,7 +4,9 @@ namespace Modules\McpForFreescout\Support;
 
 use App\Conversation;
 use App\Customer;
+use App\Folder;
 use App\Mailbox;
+use App\SendLog;
 use App\Thread;
 use App\User;
 
@@ -178,10 +180,14 @@ final class Presenter
     /**
      * A conversation without its threads.
      *
+     * `starred` tells whether the given user has starred it. Callers that present
+     * many conversations pass `$starredIds` (see starredAmong) to avoid one query each.
      * `tags` is present only when the Tags module is active, `scheduled` only
      * when the Send Later module is active.
+     *
+     * @param int[]|null $starredIds
      */
-    public static function conversationSummary(Conversation $conversation): array
+    public static function conversationSummary(Conversation $conversation, User $user, ?array $starredIds = null): array
     {
         $customer = $conversation->customer;
 
@@ -200,6 +206,7 @@ final class Presenter
             ] : null,
             'preview'       => self::text($conversation->preview),
             'last_reply_at' => self::date($conversation->last_reply_at),
+            'starred'       => in_array((int) $conversation->id, $starredIds ?? self::starredAmong([$conversation->id], $user), true),
         ];
 
         if (CompanionModules::isActive(CompanionModules::TAGS)) {
@@ -219,9 +226,38 @@ final class Presenter
     }
 
     /**
+     * The ids, among the given conversations, that the user has starred.
+     *
+     * Read from the database on every call: Conversation::isStarredByUser() keeps a
+     * per-mailbox cache that goes stale as soon as a conversation is starred or unstarred.
+     *
+     * @param  int[] $conversationIds
+     * @return int[]
+     */
+    public static function starredAmong(array $conversationIds, User $user): array
+    {
+        if (!$conversationIds) {
+            return [];
+        }
+
+        return \DB::table('conversation_folder')
+            ->join('folders', 'folders.id', '=', 'conversation_folder.folder_id')
+            ->where('folders.type', Folder::TYPE_STARRED)
+            ->where('folders.user_id', $user->id)
+            ->whereIn('conversation_folder.conversation_id', $conversationIds)
+            ->pluck('conversation_folder.conversation_id')
+            ->map(function ($id) {
+                return (int) $id;
+            })
+            ->all();
+    }
+
+    /**
      * A thread. HTML bodies are given as plain text.
      *
      * `created_by` holds a user id or a customer id, as told by `created_by_type`.
+     * `delivery` and `opened_at` are present on messages only. `opened_at` is set by a
+     * tracking image, so it is not proof that the customer read the message.
      * `draft_choices` (what happens on send, see DraftChoices) is present on drafts only.
      * `scheduled_at` is present only when the Send Later module is active, and is null
      * unless the thread is a message waiting for its scheduled time.
@@ -251,15 +287,14 @@ final class Presenter
             'created_by'      => $createdBy,
             'created_by_type' => $createdByType,
             'created_at'      => self::date($thread->created_at),
-            'attachments'     => $thread->attachments->map(function ($attachment) {
-                return [
-                    'id'        => (int) $attachment->id,
-                    'file_name' => self::text($attachment->file_name),
-                    'mime_type' => self::text($attachment->mime_type),
-                    'size'      => $attachment->size !== null ? (int) $attachment->size : null,
-                ];
-            })->all(),
+            'attachments'     => Attachments::ofThread($thread),
         ];
+
+        // A draft was never handed to the mailer; a scheduled message is published and still queued.
+        if ((int) $thread->type === Thread::TYPE_MESSAGE && (int) $thread->state === Thread::STATE_PUBLISHED) {
+            $presented['delivery'] = self::delivery($thread);
+            $presented['opened_at'] = self::date($thread->opened_at);
+        }
 
         if ((int) $thread->state === Thread::STATE_DRAFT) {
             $presented['draft_choices'] = DraftChoices::forOutput($thread);
@@ -270,6 +305,41 @@ final class Presenter
         }
 
         return $presented;
+    }
+
+    /**
+     * Where a sent message stands: queued, sent, delivered, send_error or delivery_error.
+     */
+    private static function delivery(Thread $thread): array
+    {
+        switch ((int) $thread->send_status) {
+            case 0:
+                $status = 'queued';
+                break;
+            case SendLog::STATUS_ACCEPTED:
+                $status = 'sent';
+                break;
+            case SendLog::STATUS_DELIVERY_SUCCESS:
+            case SendLog::STATUS_OPENED:
+            case SendLog::STATUS_CLICKED:
+            case SendLog::STATUS_UNSUBSCRIBED:
+            case SendLog::STATUS_COMPLAINED:
+                $status = 'delivered';
+                break;
+            case SendLog::STATUS_SEND_ERROR:
+            case SendLog::STATUS_SEND_INTERMEDIATE_ERROR:
+                $status = 'send_error';
+                break;
+            default:
+                $status = 'delivery_error';
+        }
+
+        $data = $thread->getSendStatusData();
+
+        return [
+            'status' => $status,
+            'error'  => self::text($data['msg'] ?? null),
+        ];
     }
 
     /**

@@ -6,13 +6,20 @@ use App\Option;
 use Illuminate\Support\ServiceProvider;
 use Modules\McpForFreescout\Entities\McpToken;
 use Modules\McpForFreescout\Mcp\ToolRegistry;
+use Modules\McpForFreescout\Support\Attachments;
+use Modules\McpForFreescout\Support\CurlRemoteFetcher;
 use Modules\McpForFreescout\Support\DraftChoices;
+use Modules\McpForFreescout\Support\RemoteFetcher;
+use Modules\McpForFreescout\Tools\Attachments\AddAttachmentsTool;
+use Modules\McpForFreescout\Tools\Attachments\GetAttachmentTool;
+use Modules\McpForFreescout\Tools\Attachments\RemoveAttachmentTool;
 use Modules\McpForFreescout\Tools\Conversations\AddNoteTool;
 use Modules\McpForFreescout\Tools\Conversations\DeleteConversationTool;
 use Modules\McpForFreescout\Tools\Conversations\GetConversationTool;
 use Modules\McpForFreescout\Tools\Conversations\ListConversationsTool;
 use Modules\McpForFreescout\Tools\Conversations\RestoreConversationTool;
 use Modules\McpForFreescout\Tools\Conversations\SearchConversationsTool;
+use Modules\McpForFreescout\Tools\Conversations\StarConversationTool;
 use Modules\McpForFreescout\Tools\Conversations\UpdateConversationTool;
 use Modules\McpForFreescout\Tools\Directory\GetCustomerTool;
 use Modules\McpForFreescout\Tools\Directory\ListUsersTool;
@@ -76,6 +83,7 @@ class McpForFreescoutServiceProvider extends ServiceProvider
     {
         $this->registerTranslations();
         $this->registerToolRegistry();
+        $this->app->bind(RemoteFetcher::class, CurlRemoteFetcher::class);
     }
 
     /**
@@ -152,9 +160,13 @@ class McpForFreescoutServiceProvider extends ServiceProvider
             AddNoteTool::class,
             DeleteConversationTool::class,
             RestoreConversationTool::class,
+            StarConversationTool::class,
+            GetAttachmentTool::class,
             ReplyToConversationTool::class,
             CreateConversationTool::class,
             UpdateDraftTool::class,
+            AddAttachmentsTool::class,
+            RemoveAttachmentTool::class,
             DiscardDraftTool::class,
             SendDraftTool::class,
             UpdateMailboxTool::class,
@@ -281,8 +293,21 @@ class McpForFreescoutServiceProvider extends ServiceProvider
             }
 
             return [
-                'mcpforfreescout.enabled' => Option::get('mcpforfreescout.enabled'),
+                'mcpforfreescout.enabled'             => Option::get('mcpforfreescout.enabled'),
+                'mcpforfreescout.max_attachment_size' => Attachments::maxSize(),
             ];
+        }, 20, 2);
+
+        // The form posts the size in megabytes; the option stores bytes.
+        \Eventy::addFilter('settings.before_save', function ($request, $section) {
+            $key = 'mcpforfreescout.max_attachment_size';
+            $posted = $request->input('settings', []);
+            if ($section == MCP_FOR_FREESCOUT_MODULE && is_array($posted) && array_key_exists($key, $posted)) {
+                $posted[$key] = Attachments::bytesFromMegabytes($posted[$key]);
+                $request->merge(['settings' => $posted]);
+            }
+
+            return $request;
         }, 20, 2);
 
         \Eventy::addFilter('settings.view', function ($view, $section) {

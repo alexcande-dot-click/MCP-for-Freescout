@@ -2,6 +2,7 @@
 
 namespace Modules\McpForFreescout\Tools\Drafts;
 
+use App\Attachment;
 use App\Conversation;
 use App\Mailbox;
 use App\Thread;
@@ -279,28 +280,100 @@ abstract class DraftTool extends Tool
     }
 
     /**
-     * Save a draft through FreeScout's draft autosave and return the draft thread.
+     * Find a draft the user wrote and may change.
      *
-     * @param User            $user            The author of the change.
-     * @param array           $params          Request parameters of the core `save_draft` action.
-     * @param SavedReply|null $attachmentsFrom A saved reply whose files are copied and attached to the draft, as the reply form does.
+     * Colleagues' drafts, and drafts of a trashed conversation (saving one would restore it),
+     * are refused.
      *
-     * @throws ToolError When core refuses the draft, or when the saved thread is somehow not a draft.
+     * @throws ToolError When the draft is not the user's own, or its conversation is in the trash.
      */
-    protected function saveDraft(User $user, array $params, SavedReply $attachmentsFrom = null): Thread
+    protected function findOwnDraft(int $draftId, User $user): Thread
     {
-        $copies = $attachmentsFrom ? SavedReplies::copyAttachments($attachmentsFrom) : [];
-        if ($copies) {
-            $ids = array_map(function ($copy) {
-                return encrypt($copy->id);
-            }, $copies);
-            $params += ['attachments_all' => $ids, 'attachments' => $ids];
+        $draft = $this->findDraft($draftId, $user);
+        if ((int) $draft->created_by_user_id !== (int) $user->id) {
+            throw new ToolError('Draft not found or not accessible.');
+        }
+        if ((int) $draft->conversation->state === Conversation::STATE_DELETED) {
+            throw new ToolError('The conversation is in the trash. Restore it with restore_conversation first.');
         }
 
+        return $draft;
+    }
+
+    /**
+     * The request parameters of the `save_draft` action that save a draft exactly as it is.
+     *
+     * Core saves the whole form again, so a change to one part of a draft posts all the others unchanged.
+     * The files of the draft are not posted: core keeps the ones it is not told to drop.
+     */
+    protected function currentDraftParams(Thread $draft): array
+    {
+        $conversation = $draft->conversation;
+        $to = $draft->getToArray();
+
+        $params = [
+            'mailbox_id'      => $conversation->mailbox_id,
+            'conversation_id' => $conversation->id,
+            'thread_id'       => $draft->id,
+            'body'            => (string) $draft->body,
+            'from_alias'      => $draft->from ?: null,
+            'cc'              => $draft->getCcArray(),
+            'bcc'             => $draft->getBccArray(),
+        ];
+        if ((int) $conversation->state === Conversation::STATE_DRAFT) {
+            return $params + [
+                'is_create' => 1,
+                'type'      => $conversation->type,
+                'status'    => $conversation->status,
+                'subject'   => $conversation->subject,
+                'to'        => $to,
+            ];
+        }
+
+        // A reply has a single To recipient, posted as a string like the reply form does.
+        return $params + ['to' => $to ? reset($to) : ''];
+    }
+
+    /**
+     * Save a draft through FreeScout's draft autosave and return the draft thread.
+     *
+     * @param User             $user            The author of the change.
+     * @param array            $params          Request parameters of the core `save_draft` action.
+     * @param SavedReply|null  $attachmentsFrom A saved reply whose files are copied and attached to the draft, as the reply form does.
+     * @param Attachment[]     $files           Stored files (see FileInputs::create) to attach to the draft.
+     *
+     * @throws ToolError When core refuses the draft, the message would be too large, or the saved thread is somehow not a draft.
+     *                   The copies and the given files are deleted again then.
+     */
+    protected function saveDraft(User $user, array $params, SavedReply $attachmentsFrom = null, array $files = []): Thread
+    {
         try {
+            $copies = $attachmentsFrom ? SavedReplies::copyAttachments($attachmentsFrom) : [];
+        } catch (\Throwable $e) {
+            $this->discardFiles($files);
+
+            throw $e;
+        }
+
+        $stored = array_merge($copies, $files);
+        try {
+            // The message holds the files the draft has already as well as the ones added now.
+            $sizes = array_map(function (Attachment $attachment) {
+                return (int) $attachment->size;
+            }, $stored);
+            $sizes[] = $this->attachedSize((int) ($params['thread_id'] ?? 0));
+            $this->assertWithinMessageSize((string) ($params['body'] ?? ''), $sizes);
+
+            if ($stored) {
+                $ids = array_map(function (Attachment $attachment) {
+                    return encrypt($attachment->id);
+                }, $stored);
+                $params += ['attachments_all' => $ids, 'attachments' => $ids];
+            }
+
             $result = CoreActions::conversationAjax($user, array_merge($params, ['action' => 'save_draft']));
         } catch (\Throwable $e) {
-            SavedReplies::discardCopies($copies);
+            $this->discardFiles($stored);
 
             throw $e;
         }
@@ -314,6 +387,48 @@ abstract class DraftTool extends Tool
         }
 
         return $draft;
+    }
+
+    /**
+     * Refuse a draft that is too large to be sent, with the formula core applies when a reply is sent.
+     *
+     * @param string $bodyHtml  The body of the draft.
+     * @param int[]  $fileSizes Sizes of the files to attach, in bytes.
+     *
+     * @throws ToolError When the message, increased by 37% for mail encoding, is over the
+     *                   maximum message size (APP_MAX_MESSAGE_SIZE, in MB; 0 means no limit).
+     */
+    protected function assertWithinMessageSize(string $bodyHtml, array $fileSizes): void
+    {
+        $maxMessageSize = (int) config('app.max_message_size');
+        if (!$maxMessageSize) {
+            return;
+        }
+
+        $messageSize = mb_strlen($bodyHtml, '8bit') + array_sum($fileSizes);
+        if ($messageSize * 1.37 > $maxMessageSize * 1024 * 1024) {
+            throw new ToolError('The draft would exceed the maximum message size of '.$maxMessageSize.' MB; shorten the message or attach smaller files. Remove a file with remove_attachment or send it as a link.');
+        }
+    }
+
+    /**
+     * The combined size of the regular (not embedded) files already attached to a draft, in bytes.
+     */
+    private function attachedSize(int $threadId): int
+    {
+        return $threadId ? (int) Attachment::where('thread_id', $threadId)->where('embedded', false)->sum('size') : 0;
+    }
+
+    /**
+     * Delete stored files that were made for a draft which could not be saved.
+     *
+     * @param Attachment[] $files
+     */
+    protected function discardFiles(array $files): void
+    {
+        if ($files) {
+            Attachment::deleteForever(collect($files));
+        }
     }
 
     /**

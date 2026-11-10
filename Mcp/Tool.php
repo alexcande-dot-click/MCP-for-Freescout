@@ -2,7 +2,9 @@
 
 namespace Modules\McpForFreescout\Mcp;
 
+use App\Attachment;
 use App\User;
+use Modules\McpForFreescout\Support\FileInputs;
 
 /**
  * Base class of every MCP tool.
@@ -57,13 +59,16 @@ abstract class Tool
      * @param array $arguments Arguments as sent by the client.
      * @param User  $user      The user the token belongs to.
      *
-     * @return array Structured result. It is sent as a JSON object, so it must be
-     *               an associative array (or empty); a list-shaped array is
-     *               treated as a programming error. Wrap lists in a key.
+     * @return array|ToolResult Structured result. It is sent as a JSON object, so it must be
+     *                          an associative array (or empty); a list-shaped array is
+     *                          treated as a programming error. Wrap lists in a key.
+     *                          A tool that also returns image or resource blocks wraps its
+     *                          structured result in a ToolResult. An implementation that
+     *                          always returns an array may declare `: array`.
      *
      * @throws ToolError When the call fails for a reason the model should see.
      */
-    abstract public function handle(array $arguments, User $user): array;
+    abstract public function handle(array $arguments, User $user);
 
     /**
      * The tools/list entry describing this tool.
@@ -226,6 +231,24 @@ abstract class Tool
         }
 
         return $list;
+    }
+
+    /**
+     * Store the files of the optional `attachments` argument as thread-less files of the user.
+     *
+     * @return Attachment[] Empty when the argument is absent or empty. The caller owns the files:
+     *                      it attaches them to a thread, or deletes them when the action fails.
+     *
+     * @throws ToolError When the argument is malformed or a file cannot be stored (nothing is kept then).
+     */
+    protected function optionalFiles(array $arguments, User $user): array
+    {
+        if (!$this->hasArgument($arguments, 'attachments')) {
+            return [];
+        }
+        $items = $this->listArgument($arguments['attachments'], 'attachments', 'files');
+
+        return $items ? FileInputs::create($items, $user) : [];
     }
 
     private function hasArgument(array $arguments, string $key): bool

@@ -69,6 +69,6 @@ class SearchConversationsTool extends Tool
             $filters['assigned'] = $user->id;
         }
 
-        return ConversationPage::present(Conversation::search($query, $filters, $user), $page, $perPage);
+        return ConversationPage::present(Conversation::search($query, $filters, $user), $page, $perPage, $user);
     }
 }

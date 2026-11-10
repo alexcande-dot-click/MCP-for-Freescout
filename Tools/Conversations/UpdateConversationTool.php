@@ -96,7 +96,7 @@ class UpdateConversationTool extends Tool
             ]);
         }
 
-        return Presenter::conversationSummary($conversation->fresh());
+        return Presenter::conversationSummary($conversation->fresh(), $user);
     }
 
     /**

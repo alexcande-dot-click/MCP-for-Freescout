@@ -298,6 +298,34 @@ class ConversationReadToolsTest extends TestCase
         (new SearchConversationsTool())->handle([], Fixtures::user());
     }
 
+    public function test_summaries_include_starred()
+    {
+        $user = Fixtures::user();
+        $colleague = Fixtures::user();
+        $mailbox = Fixtures::mailbox([], [$user, $colleague]);
+        $starred = Fixtures::conversation($mailbox, Fixtures::customer(), ['subject' => 'Starred one']);
+        $plain = Fixtures::conversation($mailbox, Fixtures::customer(), ['subject' => 'Plain one']);
+        $starred->star($user);
+
+        $flags = function (array $conversations) {
+            return array_column($conversations, 'starred', 'id');
+        };
+        $expected = [(int) $starred->id => true, (int) $plain->id => false];
+
+        $listed = (new ListConversationsTool())->handle(['mailbox_id' => $mailbox->id], $user)['conversations'];
+        $this->assertEquals($expected, $flags($listed));
+
+        $searched = (new SearchConversationsTool())->handle(['query' => 'one'], $user)['conversations'];
+        $this->assertEquals($expected, $flags($searched));
+
+        $this->assertTrue((new GetConversationTool())->handle(['conversation_id' => $starred->id], $user)['starred']);
+        $this->assertFalse((new GetConversationTool())->handle(['conversation_id' => $plain->id], $user)['starred']);
+
+        // Stars are personal: the colleague sees nothing starred.
+        $seenByColleague = (new ListConversationsTool())->handle(['mailbox_id' => $mailbox->id], $colleague)['conversations'];
+        $this->assertEquals([(int) $starred->id => false, (int) $plain->id => false], $flags($seenByColleague));
+    }
+
     public function test_get_conversation_returns_threads_and_attachment_metadata()
     {
         $user = Fixtures::user();

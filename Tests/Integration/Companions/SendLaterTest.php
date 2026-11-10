@@ -120,7 +120,7 @@ class SendLaterTest extends TestCase
         $thread = Presenter::thread(Thread::find($draft->id));
         $this->assertSame('published', $thread['state']);
         $this->assertSame($sendAt, $thread['scheduled_at']);
-        $this->assertTrue(Presenter::conversationSummary(Conversation::find($this->conversation->id))['scheduled']);
+        $this->assertTrue(Presenter::conversationSummary(Conversation::find($this->conversation->id), $this->user)['scheduled']);
 
         // An ordinary message is not scheduled.
         $this->assertNull(Presenter::thread(Thread::where('conversation_id', $this->conversation->id)->where('type', Thread::TYPE_CUSTOMER)->first())['scheduled_at']);

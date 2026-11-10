@@ -105,7 +105,7 @@ class ListConversationsTool extends Tool
             $query->where('conversations.user_id', $user->id);
         }
 
-        return ConversationPage::present($query, $page, $perPage);
+        return ConversationPage::present($query, $page, $perPage, $user);
     }
 
     /**

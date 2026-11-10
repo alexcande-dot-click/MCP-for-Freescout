@@ -2,7 +2,6 @@
 
 namespace Modules\McpForFreescout\Tools\Conversations;
 
-use App\Thread;
 use App\User;
 use Modules\McpForFreescout\Mcp\Tool;
 use Modules\McpForFreescout\Support\Lookup;
@@ -17,7 +16,8 @@ class GetConversationTool extends Tool
 
     public function description(): string
     {
-        return 'Get one conversation with its messages and notes, oldest first, including attachment names and sizes. '
+        return 'Get one conversation with its messages and notes, oldest first, including files (attachments and embedded images) with download links, '
+            .'and for sent replies the delivery status and the first open (`opened_at` comes from a tracking image, so it is not proof of reading). '
             .'Your own unsent drafts are included unless include_drafts is false; other users\' drafts are never shown.';
     }
 
@@ -41,31 +41,16 @@ class GetConversationTool extends Tool
 
         $threads = [];
         $records = $conversation->threads()
-            ->with('attachments')
+            ->with(['attachments', 'embeds'])
             ->orderBy('created_at')
             ->orderBy('id')
             ->get();
         foreach ($records as $thread) {
-            if ($this->isVisible($thread, $user, $includeDrafts)) {
+            if (Lookup::threadVisible($thread, $user, $includeDrafts)) {
                 $threads[] = Presenter::thread($thread);
             }
         }
 
-        return array_merge(Presenter::conversationSummary($conversation), ['threads' => $threads]);
-    }
-
-    /**
-     * Published threads are visible to everyone with access to the conversation;
-     * a draft only to its author. Hidden threads and threads held for review are not shown.
-     */
-    private function isVisible(Thread $thread, User $user, bool $includeDrafts): bool
-    {
-        if ($thread->state == Thread::STATE_PUBLISHED) {
-            return true;
-        }
-
-        return $includeDrafts
-            && $thread->state == Thread::STATE_DRAFT
-            && (int) $thread->created_by_user_id === (int) $user->id;
+        return array_merge(Presenter::conversationSummary($conversation, $user), ['threads' => $threads]);
     }
 }

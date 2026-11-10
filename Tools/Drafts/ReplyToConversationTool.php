@@ -5,6 +5,7 @@ namespace Modules\McpForFreescout\Tools\Drafts;
 use App\Conversation;
 use App\User;
 use Modules\McpForFreescout\Mcp\ToolError;
+use Modules\McpForFreescout\Support\FileInputs;
 use Modules\McpForFreescout\Support\Lookup;
 
 class ReplyToConversationTool extends DraftTool
@@ -21,6 +22,7 @@ class ReplyToConversationTool extends DraftTool
             .'Without "to" the reply goes to the conversation\'s customer, and without "cc" it copies the conversation\'s CC recipients, like the reply form. '
             .'Plain text is escaped and keeps its line breaks; a body that contains HTML is used as HTML. '
             .'Instead of a body, a saved_reply_id can supply the text; a body given with it wins and the saved reply then only adds its files. '
+            .'Files can be attached with "attachments"; they are saved with the draft and sent with it. '
             .'Returns the draft id.';
     }
 
@@ -35,6 +37,7 @@ class ReplyToConversationTool extends DraftTool
                 'to'              => $this->recipientSchema('The one recipient of the reply (default: the conversation\'s customer). Add further recipients with cc.'),
                 'cc'              => $this->recipientSchema('Copy recipients (email addresses). Without it the conversation\'s CC recipients are kept, like the reply form does; an empty list means no CC.'),
                 'bcc'             => $this->recipientSchema('Blind copy recipients (email addresses).'),
+                'attachments'     => FileInputs::schema('Files to attach to the draft. Each one comes from a link, base64 content or an existing attachment.'),
             ], $this->choiceSchemas()),
             'required'             => ['conversation_id'],
             'additionalProperties' => false,
@@ -66,6 +69,10 @@ class ReplyToConversationTool extends DraftTool
         $savedReply = $this->savedReply($arguments, $mailbox, $user);
         $body = $this->bodyHtml($arguments, $savedReply, $conversation, $user);
         $choices = $this->choices($arguments, $mailbox, $savedReply);
+        // Everything that can be refused is read before any file is stored.
+        $cc = $this->recipients($arguments, 'cc') ?? $this->defaultCc($conversation);
+        $bcc = $this->recipients($arguments, 'bcc') ?? [];
+        $files = $this->optionalFiles($arguments, $user);
 
         $draft = $this->saveDraft($user, [
             'mailbox_id'      => $mailbox->id,
@@ -74,9 +81,9 @@ class ReplyToConversationTool extends DraftTool
             'from_alias'      => $from,
             // A reply has a single To recipient, posted as a string like the reply form does.
             'to'              => $to,
-            'cc'              => $this->recipients($arguments, 'cc') ?? $this->defaultCc($conversation),
-            'bcc'             => $this->recipients($arguments, 'bcc') ?? [],
-        ], $savedReply);
+            'cc'              => $cc,
+            'bcc'             => $bcc,
+        ], $savedReply, $files);
 
         return $this->result($draft, $choices);
     }

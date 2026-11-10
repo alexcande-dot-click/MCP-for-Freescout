@@ -316,7 +316,7 @@ class TagsTest extends TestCase
         $this->assertSame(0, ConversationTag::where('tag_id', $tagId)->count());
         $this->assertNull($this->counter('vip'));
         $this->assertSame(2, $this->counter('keep'));
-        $this->assertSame(['keep'], Presenter::conversationSummary($this->conversation->fresh())['tags']);
+        $this->assertSame(['keep'], Presenter::conversationSummary($this->conversation->fresh(), $this->user)['tags']);
     }
 
     public function test_list_tags()
@@ -386,14 +386,14 @@ class TagsTest extends TestCase
 
     public function test_summary_includes_tags()
     {
-        $this->assertSame([], Presenter::conversationSummary($this->conversation->fresh())['tags']);
+        $this->assertSame([], Presenter::conversationSummary($this->conversation->fresh(), $this->user)['tags']);
 
         (new AddTagsTool())->handle(['conversation_id' => $this->conversation->id, 'names' => ['Zeta', 'alpha']], $this->user);
-        $summary = Presenter::conversationSummary($this->conversation->fresh());
+        $summary = Presenter::conversationSummary($this->conversation->fresh(), $this->user);
         $this->assertSame(['alpha', 'zeta'], $summary['tags']);
 
         $this->withCompanions(false, function () {
-            $this->assertArrayNotHasKey('tags', Presenter::conversationSummary($this->conversation->fresh()));
+            $this->assertArrayNotHasKey('tags', Presenter::conversationSummary($this->conversation->fresh(), $this->user));
         });
     }
 

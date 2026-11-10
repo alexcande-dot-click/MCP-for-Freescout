@@ -2,6 +2,7 @@
 
 namespace Modules\McpForFreescout\Support;
 
+use App\User;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Relations\Relation;
 
@@ -24,8 +25,9 @@ final class ConversationPage
      * does); its ordering is replaced and `total` counts conversations, not rows.
      *
      * @param Builder|Relation $query
+     * @param User             $user  The user the `starred` flags are given for.
      */
-    public static function present($query, int $page, int $perPage): array
+    public static function present($query, int $page, int $perPage, User $user): array
     {
         if ($query instanceof Relation) {
             $query = $query->getQuery();
@@ -45,9 +47,11 @@ final class ConversationPage
             ->take($perPage)
             ->get();
 
+        $starredIds = Presenter::starredAmong($conversations->pluck('id')->all(), $user);
+
         $presented = [];
         foreach ($conversations as $conversation) {
-            $presented[] = Presenter::conversationSummary($conversation);
+            $presented[] = Presenter::conversationSummary($conversation, $user, $starredIds);
         }
 
         return [

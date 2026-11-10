@@ -2,7 +2,7 @@
     "name": "MCP for FreeScout",
     "alias": "mcpforfreescout",
     "description": "Model Context Protocol server for FreeScout: lets an AI agent work in your help desk as a regular user, drafting replies for human review.",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "detailsUrl": "https://github.com/alexcande-dot-click/mcp-for-freescout",
     "author": "Maumar.Click",
     "authorUrl": "https://maumar.click",
